@@ -1,4 +1,4 @@
-# QGIS MCP Plugin
+# QGIS MCP Plugin Optimized for Reasonix
 
 让 Reasonix（或任何支持 MCP 协议的工具）直接操控本地 QGIS 插件。
 为了能够实战使用，修改了原作者的代码版本。
