@@ -1,100 +1,95 @@
-# QGIS MCP
+# QGIS MCP Plugin
 
-QGIS MCP connects QGIS to chat clients that support the Model Context Protocol (MCP). It lets an assistant inspect and control a local QGIS session through a QGIS plugin plus a Python MCP server.
+让 Reasonix（或任何支持 MCP 协议的工具）直接操控本地 QGIS 插件。
+为了能够实战使用，修改了原作者的代码版本。
 
-## Features
+## 架构
 
-- Two-way communication between the MCP server and QGIS through a local socket.
-- Create, load and save QGIS projects.
-- Add and remove vector or raster layers.
-- List layers and inspect vector features.
-- Execute QGIS Processing algorithms.
-- Render the current map view to an image file.
-- Execute PyQGIS code from the chat client.
+```
+Reasonix ←→ MCP Bridge (Python) ←→ TCP :9876 ←→ 本插件 (QGIS 内部)
+```
 
-## Components
+- **本插件**（`qgis_mcp_plugin/`）：运行在 QGIS 内部，监听 TCP 9876 端口，接收 JSON 命令后执行 PyQGIS 代码
+- **MCP Bridge**（`src/qgis_mcp/qgis_mcp_server.py`）：独立 Python 进程，将 MCP 协议转为 TCP 命令
+- **Reasonix**：通过 MCP 协议调用 Bridge 提供的工具（`qgis_ping`、`qgis_execute_code`、`qgis_render_map` 等）
 
-- `qgis_mcp_plugin/`: QGIS plugin that opens a local socket server inside QGIS.
-- `src/qgis_mcp/qgis_mcp_server.py`: MCP server that exposes QGIS tools to the chat client.
-- `src/qgis_mcp/qgis_socket_client.py`: simple socket client for direct tests.
-
-## Requirements
-
-- QGIS 3.x
-- Python 3.10 or newer
-- `uv` package manager
-- An MCP-compatible chat client
-
-## Install
-
-Clone the repository:
+## 安装
 
 ```bash
-git clone https://github.com/lpochettino-gis/QGIS-MCP.git
+# macOS
+cp -r qgis_mcp_plugin/ \
+  ~/Library/Application\ Support/QGIS/QGIS3/profiles/default/python/plugins/
+
+# Windows
+xcopy qgis_mcp_plugin\ "%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\qgis_mcp_plugin\" /E
+
+# Linux
+cp -r qgis_mcp_plugin/ \
+  ~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/
 ```
 
-Install `uv` if needed:
+## 在 QGIS 中激活
 
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+1. 打开 QGIS
+2. 菜单 → **Plugins → Manage and Install Plugins**
+3. 切换到 **Installed** 标签
+4. 搜索 "QGIS MCP" → 勾选启用
+5. 右侧会出现 **QGIS MCP** 停靠面板，底部状态栏显示 `QGIS MCP server started on localhost:9876`
 
-Copy `qgis_mcp_plugin` into your active QGIS profile plugin folder. In QGIS, open `Settings > User Profiles > Open Active Profile Folder`, then copy the folder into `python/plugins`.
+## 在 Reasonix 中配置
 
-On Windows the plugin folder is commonly:
-
-```text
-C:\Users\USER\AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins
-```
-
-Restart QGIS, open `Plugins > Manage and Install Plugins`, search for `QGIS MCP`, and enable it.
-
-## MCP Client Configuration
-
-Example configuration:
+编辑 `~/.reasonix/config.json`，在 `mcp` 数组中添加：
 
 ```json
 {
-  "mcpServers": {
-    "qgis": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "C:\\path\\to\\QGIS-MCP\\src\\qgis_mcp",
-        "run",
-        "qgis_mcp_server.py"
-      ]
-    }
-  }
+  "mcp": [
+    "qgis=uv --directory \"/path/to/QGIS-MCP-main/src/qgis_mcp\" run qgis_mcp_server.py"
+  ]
 }
 ```
 
-## Usage
+重启 Reasonix 后生效。
 
-1. Open QGIS.
-2. Start the plugin from `Plugins > QGIS MCP > QGIS MCP`.
-3. Click `Start Server`.
-4. Start or reload your MCP chat client.
-5. Use the exposed QGIS tools from chat.
+## 支持的 PyQGIS 命令
 
-## Tools
+插件通过 TCP 接收 JSON 命令（`{type: "command_name", params: {...}}`），支持的命令：
 
-- `ping`
-- `get_qgis_info`
-- `load_project`
-- `create_new_project`
-- `get_project_info`
-- `add_vector_layer`
-- `add_raster_layer`
-- `get_layers`
-- `remove_layer`
-- `zoom_to_layer`
-- `get_layer_features`
-- `execute_processing`
-- `save_project`
-- `render_map`
-- `execute_code`
+| 命令 | 说明 |
+|:-----|:-----|
+| `ping` | 检查连通性 |
+| `get_qgis_info` | 获取 QGIS 版本信息 |
+| `get_project_info` | 获取当前工程信息 |
+| `load_project` | 加载 .qgs 工程 |
+| `create_new_project` | 新建工程 |
+| `save_project` | 保存工程 |
+| `get_layers` | 列出所有图层 |
+| `add_vector_layer` | 加矢量层 |
+| `add_raster_layer` | 加栅格层 |
+| `remove_layer` | 删除图层 |
+| `zoom_to_layer` | 缩放到图层范围 |
+| `get_layer_features` | 获取图层要素 |
+| `execute_processing` | 运行 Processing 算法 |
+| `execute_code` | **执行任意 PyQGIS 代码** ⭐ |
+| `render_map` | 渲染画布为 PNG |
 
-## Security
+## 调试
 
-This MCP can execute arbitrary PyQGIS code and modify local projects. Use it only with trusted prompts and local files. Do not expose the QGIS socket server outside `localhost`.
+插件日志在 QGIS 的 **Log Messages** 面板（View → Panels → Log Messages），标签页为 "QGIS MCP"。
+
+如果 Reasonix 连不上：
+1. 确认 QGIS 中插件已启用（Plugins 菜单中勾选）
+2. 确认状态栏显示 `localhost:9876` 已启动
+3. 确认 MCP Bridge 进程正在运行
+4. 确认 `config.json` 中 `--directory` 路径正确
+
+## 已知限制
+
+- `execute_code` 超时 60 秒——大文件处理需缩小范围或增大像素
+- QGIS API 是 C++ 绑定，枚举值必须传 enum 类型而非 int
+- 图层树 `findLayer()` 不递归搜索子组——需手写遍历
+- Print Layout 导出时需显式设置 `m.setLayers([...])`
+
+## 版本
+
+- v1.0 — 初始版本
+- 修改于 2026-06-02 — 移除 `transport="stdio"` 参数以兼容当前 FastMCP 版本
