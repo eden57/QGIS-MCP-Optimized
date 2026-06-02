@@ -82,14 +82,7 @@ cp -r qgis_mcp_plugin/ \
 3. 确认 MCP Bridge 进程正在运行
 4. 确认 `config.json` 中 `--directory` 路径正确
 
-## 已知限制
-
-- `execute_code` 超时 60 秒——大文件处理需缩小范围或增大像素
-- QGIS API 是 C++ 绑定，枚举值必须传 enum 类型而非 int
-- 图层树 `findLayer()` 不递归搜索子组——需手写遍历
-- Print Layout 导出时需显式设置 `m.setLayers([...])`
 
 ## 版本
 
-- v1.0 — 初始版本
 - 修改于 2026-06-02 — 移除 `transport="stdio"` 参数以兼容当前 FastMCP 版本
