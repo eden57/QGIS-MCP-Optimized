@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+QGIS MCP Client - 工业级优化版 (Optimized for speed, stability, and protocol purity)
+"""
+
+import logging
+import sys
+from contextlib import asynccontextmanager
+import socket
+import struct
+import json
+from typing import AsyncIterator, Dict, Any
+from mcp.server.fastmcp import FastMCP, Context
+
+_HEADER_STRUCT = struct.Struct(">I")
+
+# [优化 1]：增大接收缓冲区到 4MB，大幅提升空间数据传输速度，避免 I/O 拥塞
+_RECV_BUFFER_SIZE = 4 * 1048576  
+
+# [优化 2]：协议纯净保护，强制所有基础日志输出到 stderr
+logging.basicConfig(
+    level=logging.ERROR,  
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stderr  
+)
+logger = logging.getLogger("QgisMCPServer")
+
+# [优化 2.1]：禁用所有第三方库的日志，彻底消除隐性 stdout 输出导致的大模型解析断流
+logging.getLogger("mcp").setLevel(logging.CRITICAL)
+logging.getLogger("fastmcp").setLevel(logging.CRITICAL)
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+class QgisMCPServer:
+    def __init__(self, host='localhost', port=9876):
+        self.host = host
+        self.port = port
+        self.socket = None
+        # [优化 3]：添加 120 秒超长连接超时，保障长耗时 GIS 分析任务不断连
+        self.timeout = 120 
+
+    def connect(self):
+        """Connect to the QGIS MCP server with timeout and optimized TCP settings"""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(self.timeout)
+            
+            # [优化 4]：禁用 Nagle 算法，消除网络底层排队缓冲，将指令延迟压榨至毫秒级
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # 禁用不必要的 KeepAlive，减少长连接干扰
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 0)
+            
+            self.socket.connect((self.host, self.port))
+            return True
+        except Exception as e:
+            logger.error(f"Error connecting to server: {str(e)}")
+            self.disconnect()
+            return False
+
+    def disconnect(self):
+        """Disconnect from the server safely - 解决端口残留问题"""
+        if self.socket:
+            try:
+                # [优化 5]：标准退场流程，先停止读写，再彻底关闭，防止端口假死占用
+                self.socket.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+            self.socket = None
+
+    def is_connected(self):
+        """
+        [致命缺陷修复]：纯被动可靠连接检测
+        仅通过 MSG_PEEK 探测底层 TCP 状态，绝不主动发送脏数据破坏协议。
+        """
+        if not self.socket:
+            return False
+        
+        try:
+            self.socket.setblocking(False)
+            # MSG_PEEK 只读取不消耗，如果返回空，说明连接已被对端干净断开
+            data = self.socket.recv(1, socket.MSG_PEEK)
+            self.socket.setblocking(True)
+            
+            if data == b'':
+                return False
+            return True
+            
+        except BlockingIOError:
+            # 正常：连接活着，通道内暂无数据
+            self.socket.setblocking(True)
+            return True
+        except Exception:
+            # 异常：链路已断开 (如 ConnectionResetError)
+            self.socket.setblocking(True)
+            return False
+
+    def send_command(self, command_type, params=None, _is_retry=False):
+        """
+        [核心机制补齐]：引入乐观发送与无感重试的自愈架构
+        """
+        # 1. 基础检查，失效则预重建
+        if not self.is_connected():
+            self.disconnect()
+            if not self.connect():
+                raise Exception("Could not connect to QGIS server")
+
+        command = {"type": command_type, "params": params or {}}
+
+        try:
+            # 2. 发送指令
+            data = json.dumps(command, ensure_ascii=False).encode('utf-8')
+            self.socket.sendall(_HEADER_STRUCT.pack(len(data)) + data)
+
+            # 3. 读取 4 字节头部
+            header_buf = self.socket.recv(4, socket.MSG_WAITALL)
+            if len(header_buf) != 4:
+                raise Exception("Incomplete header received from server")
+            
+            msg_len = _HEADER_STRUCT.unpack(header_buf)[0]
+
+            # 4. 大块读取业务主体
+            response_data = b''
+            while len(response_data) < msg_len:
+                remaining = msg_len - len(response_data)
+                chunk = self.socket.recv(min(_RECV_BUFFER_SIZE, remaining))
+                if not chunk:
+                    raise Exception("Connection closed prematurely during body transfer")
+                response_data += chunk
+
+            return json.loads(response_data.decode('utf-8'))
+
+        except Exception as e:
+            logger.error(f"Command execution failed: {str(e)}")
+            self.disconnect()
+            
+            # === 自愈核心 ===：如果是第一次失败，透明地发起一次重连重试
+            if not _is_retry:
+                if self.connect():
+                    return self.send_command(command_type, params, _is_retry=True)
+            
+            raise Exception(f"Command failed after auto-retry: {str(e)}")
+
+# ================= 工具生命周期与状态管理 =================
+
+_qgis_connection = None
+
+def get_qgis_connection():
+    """带状态自愈的连接管理器"""
+    global _qgis_connection
+
+    if _qgis_connection is not None and _qgis_connection.is_connected():
+        return _qgis_connection
+
+    if _qgis_connection:
+        try:
+            _qgis_connection.disconnect()
+        except Exception:
+            pass
+        _qgis_connection = None
+
+    _qgis_connection = QgisMCPServer(host="localhost", port=9876)
+    if not _qgis_connection.connect():
+        _qgis_connection = None
+        raise Exception("Could not connect to Qgis. Make sure the Qgis plugin is running.")
+    
+    return _qgis_connection
+
+@asynccontextmanager
+async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
+    """安全接管中间件生命周期，退出时保证资源释放"""
+    try:
+        yield {}
+    finally:
+        global _qgis_connection
+        if _qgis_connection:
+            _qgis_connection.disconnect()
+            _qgis_connection = None
+
+mcp = FastMCP(
+    "Qgis_mcp",
+    lifespan=server_lifespan,
+)
+
+# ================= MCP 业务接口注册 =================
+
+@mcp.tool()
+def ping(ctx: Context) -> dict:
+    """Simple ping command to check server connectivity"""
+    qgis = get_qgis_connection()
+    return qgis.send_command("ping")
+
+@mcp.tool()
+def get_qgis_info(ctx: Context) -> dict:
+    """Get QGIS information"""
+    qgis = get_qgis_connection()
+    return qgis.send_command("get_qgis_info")
+
+@mcp.tool()
+def load_project(ctx: Context, path: str) -> dict:
+    """Load a QGIS project from the specified path."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("load_project", {"path": path})
+
+@mcp.tool()
+def create_new_project(ctx: Context, path: str) -> dict:
+    """Create a new project and save it."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("create_new_project", {"path": path})
+
+@mcp.tool()
+def get_project_info(ctx: Context) -> dict:
+    """Get current project information"""
+    qgis = get_qgis_connection()
+    return qgis.send_command("get_project_info")
+
+@mcp.tool()
+def add_vector_layer(ctx: Context, path: str, provider: str = "ogr", name: str = None) -> dict:
+    """Add a vector layer to the project."""
+    qgis = get_qgis_connection()
+    params = {"path": path, "provider": provider}
+    if name:
+        params["name"] = name
+    return qgis.send_command("add_vector_layer", params)
+
+@mcp.tool()
+def add_raster_layer(ctx: Context, path: str, provider: str = "gdal", name: str = None) -> dict:
+    """Add a raster layer to the project."""
+    qgis = get_qgis_connection()
+    params = {"path": path, "provider": provider}
+    if name:
+        params["name"] = name
+    return qgis.send_command("add_raster_layer", params)
+
+@mcp.tool()
+def get_layers(ctx: Context) -> dict:
+    """Retrieve all layers in the current project."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("get_layers")
+
+@mcp.tool()
+def remove_layer(ctx: Context, layer_id: str) -> dict:
+    """Remove a layer from the project by its ID."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("remove_layer", {"layer_id": layer_id})
+
+@mcp.tool()
+def zoom_to_layer(ctx: Context, layer_id: str) -> dict:
+    """Zoom to the extent of a specified layer."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("zoom_to_layer", {"layer_id": layer_id})
+
+@mcp.tool()
+def get_layer_features(ctx: Context, layer_id: str, limit: int = 10) -> dict:
+    """Retrieve features from a vector layer with an optional limit."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("get_layer_features", {"layer_id": layer_id, "limit": limit})
+
+@mcp.tool()
+def execute_processing(ctx: Context, algorithm: str, parameters: dict) -> dict:
+    """Execute a processing algorithm with the given parameters."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("execute_processing", {"algorithm": algorithm, "parameters": parameters})
+
+@mcp.tool()
+def save_project(ctx: Context, path: str = None) -> dict:
+    """Save the current project to the given path, or to the current project path if not specified."""
+    qgis = get_qgis_connection()
+    params = {}
+    if path:
+        params["path"] = path
+    return qgis.send_command("save_project", params)
+
+@mcp.tool()
+def render_map(ctx: Context, path: str, width: int = 800, height: int = 600) -> dict:
+    """Render the current map view to an image file with the specified dimensions."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("render_map", {"path": path, "width": width, "height": height})
+
+@mcp.tool()
+def execute_code(ctx: Context, code: str) -> dict:
+    """Execute arbitrary PyQGIS code provided as a string."""
+    qgis = get_qgis_connection()
+    return qgis.send_command("execute_code", {"code": code})
+
+
+def main():
+    """Run the MCP server with unbuffered I/O"""
+    # [优化 8]：强制禁用 Python 输出缓冲，这是 stdio 模式下防止响应阻塞的最关键一步
+    sys.stdout.reconfigure(line_buffering=False)
+    sys.stderr.reconfigure(line_buffering=False)
+    
+    mcp.run(transport="stdio")
+
+if __name__ == "__main__":
+    main()
